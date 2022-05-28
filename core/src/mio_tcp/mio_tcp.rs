@@ -3,7 +3,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use std::error::Error;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 // ugly
@@ -86,7 +86,7 @@ impl MioTcpChat {
         loop {
             // Received an event for the TCP server socket, which
             // indicates we can accept a new connection.
-            let (mut connection, address) = match self.listener.accept() {
+            let mut chat_connection = match self.listener.accept() {
                 Ok((connection, address)) => (connection, address),
                 Err(e) if Self::would_block(&e) => {
                     // No more queued connections, go back to polling
@@ -95,17 +95,18 @@ impl MioTcpChat {
                 Err(e) => return Err(Box::new(e)),
             };
 
-            println!("Accepted connection from: {}", address);
-            dbg!(&self.listener_token);
-            dbg!(&self.chat_connection_token);
+            println!("Accepted connection from: {}", chat_connection.1);
+
             // Register this new connection
             // TODO: Can I register multiple clients on one connection
             //   what happens now?
             self.poll.registry().register(
-                &mut connection,
+                &mut chat_connection.0,
                 self.chat_connection_token,
-                Interest::READABLE.add(Interest::WRITABLE),
+                Interest::READABLE,
             )?;
+
+            self.chat_connection = Some(chat_connection.0);
         }
         Ok(())
     }
