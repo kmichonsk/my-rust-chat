@@ -6,7 +6,6 @@ use std::error::Error;
 use std::io::Read;
 use std::time::Duration;
 
-// ugly
 use crate::mio_tcp::utils::UniqueTokenGenerator;
 
 pub fn run_chat() -> Result<(), Box<dyn Error>> {
@@ -28,7 +27,7 @@ struct MioTcpChat {
 }
 
 impl MioTcpChat {
-    /// Create and initialize tcp chat server
+    /// Create and initialize the tcp chat server struct
     fn new() -> Result<MioTcpChat, Box<dyn Error>> {
         let mut token_generator = UniqueTokenGenerator::new();
         let mut chat = MioTcpChat {
@@ -84,8 +83,6 @@ impl MioTcpChat {
         // why is a loop here tho?
         // is it that one event can mean multiple different connections?
         loop {
-            // Received an event for the TCP server socket, which
-            // indicates we can accept a new connection.
             let mut chat_connection = match self.listener.accept() {
                 Ok((connection, address)) => (connection, address),
                 Err(e) if Self::would_block(&e) => {
@@ -97,9 +94,6 @@ impl MioTcpChat {
 
             println!("Accepted connection from: {}", chat_connection.1);
 
-            // Register this new connection
-            // TODO: Can I register multiple clients on one connection
-            //   what happens now?
             self.poll.registry().register(
                 &mut chat_connection.0,
                 self.chat_connection_token,
@@ -112,11 +106,6 @@ impl MioTcpChat {
     }
 
     fn handle_chat_connection_token_event(&mut self, event: &Event) -> Result<(), Box<dyn Error>> {
-        // we're polling for readable events only
-        if !event.is_readable() {
-            unreachable!()
-        }
-
         let chat_connection = self
             .chat_connection
             .as_mut()
@@ -140,8 +129,6 @@ impl MioTcpChat {
                         received_data.resize(received_data.len() + 1024, 0);
                     }
                 }
-                // Would block "errors" are the OS's way of saying that the
-                // connection is not actually ready to perform this I/O operation.
                 Err(ref err) if Self::would_block(err) => break,
                 Err(ref err) if Self::interrupted(err) => continue,
                 Err(err) => return Err(Box::new(err)),
@@ -150,18 +137,13 @@ impl MioTcpChat {
 
         if bytes_read != 0 {
             let received_data = &received_data[..bytes_read];
+            let peer_addr = chat_connection
+                .peer_addr()
+                .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
             if let Ok(str_buf) = std::str::from_utf8(received_data) {
-                println!(
-                    "{}: {}",
-                    chat_connection.peer_addr().unwrap(),
-                    str_buf.trim_end()
-                );
+                println!("{}: {}", peer_addr, str_buf.trim_end());
             } else {
-                println!(
-                    "None UTF-8! {}: {:?}",
-                    chat_connection.peer_addr().unwrap(),
-                    received_data
-                );
+                println!("None UTF-8 data from {}", peer_addr);
             }
         }
 
