@@ -1,6 +1,7 @@
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
+use std::collections::HashMap;
 
 use std::error::Error;
 use std::io::Read;
@@ -19,11 +20,10 @@ pub fn run_chat() -> Result<(), Box<dyn Error>> {
 
 struct MioTcpChat {
     poll: Poll,
-    _token_generator: UniqueTokenGenerator,
+    token_generator: UniqueTokenGenerator,
     listener: TcpListener,
     listener_token: Token,
-    chat_connection: Option<TcpStream>,
-    chat_connection_token: Token,
+    client_connections: HashMap<Token, TcpStream>,
 }
 
 impl MioTcpChat {
@@ -34,9 +34,8 @@ impl MioTcpChat {
             poll: Poll::new()?,
             listener: TcpListener::bind("127.0.0.1:9000".parse()?)?,
             listener_token: token_generator.generate(),
-            chat_connection: None,
-            chat_connection_token: token_generator.generate(),
-            _token_generator: token_generator,
+            client_connections: HashMap::new(),
+            token_generator,
         };
 
         // register our tcp listener for polling readable events from it
@@ -69,10 +68,7 @@ impl MioTcpChat {
 
             match event.token() {
                 token if token == self.listener_token => self.handle_server_token_event()?,
-                token if token == self.chat_connection_token => {
-                    self.handle_chat_connection_token_event(event)?
-                }
-                _ => eprintln!("Weird event without associated connection: ${:?}", event),
+                _ => self.handle_client_connection_token_event(event)?,
             }
         }
 
@@ -83,7 +79,7 @@ impl MioTcpChat {
         // why is a loop here tho?
         // is it that one event can mean multiple different connections?
         loop {
-            let mut chat_connection = match self.listener.accept() {
+            let (mut client_connection, address) = match self.listener.accept() {
                 Ok((connection, address)) => (connection, address),
                 Err(e) if Self::would_block(&e) => {
                     // No more queued connections, go back to polling
@@ -92,31 +88,37 @@ impl MioTcpChat {
                 Err(e) => return Err(Box::new(e)),
             };
 
-            println!("Accepted connection from: {}", chat_connection.1);
+            println!("Accepted connection from: {}", address);
 
+            let client_connection_token = self.token_generator.generate();
             self.poll.registry().register(
-                &mut chat_connection.0,
-                self.chat_connection_token,
+                &mut client_connection,
+                client_connection_token,
                 Interest::READABLE,
             )?;
 
-            self.chat_connection = Some(chat_connection.0);
+            self.client_connections.insert(client_connection_token, client_connection);
         }
         Ok(())
     }
 
-    fn handle_chat_connection_token_event(&mut self, event: &Event) -> Result<(), Box<dyn Error>> {
-        let chat_connection = self
-            .chat_connection
-            .as_mut()
-            .expect("Early chat connection shutdown!");
+    fn handle_client_connection_token_event(&mut self, event: &Event) -> Result<(), Box<dyn Error>> {
+        // first verify if we know of this connection
+        let client_connection = match self.client_connections.get_mut(&event.token()) {
+            Some(connection ) => connection,
+            None => {
+                eprintln!("Weird event without associated connection: ${:?}", event);
+                return Ok(());
+            }
+        };
 
         let mut received_data = vec![0; 4096];
         let mut bytes_read = 0;
         let mut connection_closed = false;
 
         loop {
-            match chat_connection.read(&mut received_data[bytes_read..]) {
+            // write starting from where we left off
+            match client_connection.read(&mut received_data[bytes_read..]) {
                 Ok(0) => {
                     // Reading 0 bytes means the other side has closed the
                     // connection or is done writing, then so are we.
@@ -137,7 +139,7 @@ impl MioTcpChat {
 
         if bytes_read != 0 {
             let received_data = &received_data[..bytes_read];
-            let peer_addr = chat_connection
+            let peer_addr = client_connection
                 .peer_addr()
                 .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
             if let Ok(str_buf) = std::str::from_utf8(received_data) {
@@ -149,7 +151,7 @@ impl MioTcpChat {
 
         if connection_closed {
             println!("Connection closed");
-            self.poll.registry().deregister(chat_connection)?;
+            self.poll.registry().deregister(client_connection)?;
         }
         Ok(())
     }
