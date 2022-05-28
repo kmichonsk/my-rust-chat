@@ -3,11 +3,11 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::time::Duration;
 
 // ugly
-use crate::mio_tcp::unique_token_generator::UniqueTokenGenerator;
+use crate::mio_tcp::utils::UniqueTokenGenerator;
 
 pub fn run_chat() -> Result<(), Box<dyn Error>> {
     let mut chat = MioTcpChat::new()?;
@@ -20,7 +20,7 @@ pub fn run_chat() -> Result<(), Box<dyn Error>> {
 
 struct MioTcpChat {
     poll: Poll,
-    token_generator: UniqueTokenGenerator,
+    _token_generator: UniqueTokenGenerator,
     listener: TcpListener,
     listener_token: Token,
     chat_connection: Option<TcpStream>,
@@ -37,7 +37,7 @@ impl MioTcpChat {
             listener_token: token_generator.generate(),
             chat_connection: None,
             chat_connection_token: token_generator.generate(),
-            token_generator,
+            _token_generator: token_generator,
         };
 
         // register our tcp listener for polling readable events from it
