@@ -6,14 +6,15 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::io::Read;
 use std::time::Duration;
+use log::{debug, info, warn};
 
 use crate::mio_tcp::utils::UniqueTokenGenerator;
 
 pub fn run_chat() -> Result<(), Box<dyn Error>> {
     let mut chat = MioTcpChat::new()?;
 
-    println!("You can connect to the server using `nc`:");
-    println!(" $ nc 127.0.0.1 9000");
+    info!("You can connect to the server using `nc`:");
+    info!(" $ nc 127.0.0.1 9000");
 
     chat.start_event_loop()
 }
@@ -64,7 +65,7 @@ impl MioTcpChat {
 
         // Process each event we got
         for event in events_storage.iter() {
-            println!("New event!\n\t{:?}\n", event);
+            debug!("New event!\n\t{:?}\n", event);
 
             match event.token() {
                 token if token == self.listener_token => self.handle_server_token_event()?,
@@ -88,7 +89,7 @@ impl MioTcpChat {
                 Err(e) => return Err(Box::new(e)),
             };
 
-            println!("Accepted connection from: {}", address);
+            info!("Accepted connection from: {}", address);
 
             let client_connection_token = self.token_generator.generate();
             self.poll.registry().register(
@@ -107,7 +108,7 @@ impl MioTcpChat {
         let client_connection = match self.client_connections.get_mut(&event.token()) {
             Some(connection ) => connection,
             None => {
-                eprintln!("Weird event without associated connection: ${:?}", event);
+                warn!("Weird event without associated connection: ${:?}", event);
                 return Ok(());
             }
         };
@@ -143,14 +144,14 @@ impl MioTcpChat {
                 .peer_addr()
                 .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
             if let Ok(str_buf) = std::str::from_utf8(received_data) {
-                println!("{}: {}", peer_addr, str_buf.trim_end());
+                info!("{}: {}", peer_addr, str_buf.trim_end());
             } else {
-                println!("None UTF-8 data from {}", peer_addr);
+                warn!("None UTF-8 data from {}", peer_addr);
             }
         }
 
         if connection_closed {
-            println!("Connection closed");
+            info!("Connection closed");
             self.poll.registry().deregister(client_connection)?;
         }
         Ok(())
