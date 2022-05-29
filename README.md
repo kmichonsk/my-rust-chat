@@ -9,7 +9,10 @@ Mostly copied code from each used library's official tutorials.
 Directory with chat backend implementations.
 
 ## Backlog
-[x] tcp using mio
-[ ] async-std: https://book.async.rs/tutorial/index.html
-[ ] tcp using tokio
-[ ] websockets using tokio-tungstenite
+- [x] tcp using mio
+
+- [ ] async-std: https://book.async.rs/tutorial/index.html
+
+- [ ] tcp using tokio
+
+- [ ] websockets using tokio-tungstenite
