@@ -1,12 +1,15 @@
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 
-use std::error::Error;
-use std::io::Read;
-use std::time::Duration;
 use log::{debug, info, warn};
+use std::error::Error;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::time::Duration;
 
 use crate::mio_tcp::utils::UniqueTokenGenerator;
 
@@ -19,12 +22,40 @@ pub fn run_chat() -> Result<(), Box<dyn Error>> {
     chat.start_event_loop()
 }
 
+#[derive(Debug)]
+struct Message {
+    from: SocketAddr,
+    content: String,
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}: {})", self.from.to_string(), self.content)
+    }
+}
+
+// TODO: add peer_addr, with tpc_streams lifetime to the ClientConnection struct,
+//   checking every time for valid socketaddr from tcpstream is annoying
+struct ClientConnection {
+    tcp_stream: TcpStream,
+    pending_messages: VecDeque<Rc<RefCell<Message>>>,
+}
+
+impl ClientConnection {
+    fn new(tcp_stream: TcpStream) -> ClientConnection {
+        ClientConnection {
+            pending_messages: VecDeque::new(),
+            tcp_stream,
+        }
+    }
+}
+
 struct MioTcpChat {
     poll: Poll,
     token_generator: UniqueTokenGenerator,
     listener: TcpListener,
     listener_token: Token,
-    client_connections: HashMap<Token, TcpStream>,
+    client_connections: HashMap<Token, ClientConnection>,
 }
 
 impl MioTcpChat {
@@ -95,31 +126,78 @@ impl MioTcpChat {
             self.poll.registry().register(
                 &mut client_connection,
                 client_connection_token,
-                Interest::READABLE,
+                Interest::READABLE.add(Interest::WRITABLE),
             )?;
 
-            self.client_connections.insert(client_connection_token, client_connection);
+            self.client_connections.insert(
+                client_connection_token,
+                ClientConnection::new(client_connection),
+            );
         }
         Ok(())
     }
 
-    fn handle_client_connection_token_event(&mut self, event: &Event) -> Result<(), Box<dyn Error>> {
+    /*
+    Now if this is supposed to be a chat how to handle the messages?
+        - we start the server and register each new client for polling with readable and writable interest
+        - when we get a message:
+            - for each client we push the message to its queue so that it can
+               be sent to them once the socket becomes writable
+        - when we get an event that a socket became writable we write the messages to it
+        - after writing we re-register the socket as readable
+
+       This is kind of shit but whatever, I'm trying to learn
+     */
+    fn handle_client_connection_token_event(
+        &mut self,
+        event: &Event,
+    ) -> Result<(), Box<dyn Error>> {
         // first verify if we know of this connection
-        let client_connection = match self.client_connections.get_mut(&event.token()) {
-            Some(connection ) => connection,
-            None => {
-                warn!("Weird event without associated connection: ${:?}", event);
-                return Ok(());
-            }
-        };
+        let token = &event.token();
+        if !self.client_connections.contains_key(token) {
+            warn!("Weird event without associated connection: ${:?}", event);
+            return Ok(());
+        }
 
-        let mut received_data = vec![0; 4096];
-        let mut bytes_read = 0;
         let mut connection_closed = false;
+        if event.is_readable() {
+            let mut received_data = vec![0; 4096];
+            let (did_close, bytes_read) = self.read_from_client(token, &mut received_data)?;
+            if bytes_read != 0 {
+                self.handle_client_message(token, &mut received_data, bytes_read);
+            }
+            connection_closed = did_close;
+        }
 
+        if event.is_writable() {
+            self.write_pending_messages_to_client(token)?;
+        }
+
+        if connection_closed {
+            let mut client_connection = self.client_connections.remove(token).unwrap();
+            info!(
+                "Connection with {} closed",
+                Self::get_peer_addr_or_default(&client_connection.tcp_stream)
+            );
+            self.poll
+                .registry()
+                .deregister(&mut client_connection.tcp_stream)?;
+        }
+        Ok(())
+    }
+
+    /// returns (did_connection_close, bytes_read)
+    fn read_from_client(
+        &mut self,
+        token: &Token,
+        received_data: &mut Vec<u8>,
+    ) -> Result<(bool, usize), Box<dyn Error>> {
+        let client_tcp_stream = &mut self.client_connections.get_mut(token).unwrap().tcp_stream;
+        let mut connection_closed = false;
+        let mut bytes_read: usize = 0;
         loop {
             // write starting from where we left off
-            match client_connection.read(&mut received_data[bytes_read..]) {
+            match client_tcp_stream.read(&mut received_data[bytes_read..]) {
                 Ok(0) => {
                     // Reading 0 bytes means the other side has closed the
                     // connection or is done writing, then so are we.
@@ -137,24 +215,94 @@ impl MioTcpChat {
                 Err(err) => return Err(Box::new(err)),
             }
         }
+        Ok((connection_closed, bytes_read))
+    }
 
-        if bytes_read != 0 {
-            let received_data = &received_data[..bytes_read];
-            let peer_addr = client_connection
-                .peer_addr()
-                .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
-            if let Ok(str_buf) = std::str::from_utf8(received_data) {
-                info!("{}: {}", peer_addr, str_buf.trim_end());
-            } else {
-                warn!("None UTF-8 data from {}", peer_addr);
+    fn handle_client_message(
+        &mut self,
+        token: &Token,
+        received_data: &mut [u8],
+        bytes_read: usize,
+    ) {
+        let client_tcp_stream = &mut self.client_connections.get_mut(token).unwrap().tcp_stream;
+        let peer_addr = match client_tcp_stream.peer_addr() {
+            Ok(addr) => addr,
+            Err(_) => {
+                warn!("Dropping weird message from peer with no address.");
+                return;
+            },
+        };
+
+        if let Ok(str_buf) = std::str::from_utf8(&received_data[..bytes_read]) {
+            let message = Message {
+                from: peer_addr,
+                content: String::from(str_buf.trim_end()),
+            };
+
+            info!("Registered message:'\n\t{}", message);
+            self.queue_message_for_other_peers(message);
+        } else {
+            warn!("Dropping message with none UTF-8 content from {}", peer_addr);
+        }
+    }
+
+
+    fn queue_message_for_other_peers(&mut self, message: Message) {
+        let message = Rc::new(RefCell::new(message));
+        // FIXME: Note: `#[warn(clippy::for_kv_map)]` on by default
+        for (_, connection) in &mut self.client_connections {
+            if connection.tcp_stream.peer_addr().unwrap() != message.borrow().from {
+                connection.pending_messages.push_front(message.clone());
+            }
+        }
+        info!("message pushed for peers: {:?}", message.borrow());
+    }
+
+    fn write_pending_messages_to_client(&mut self, token: &Token) -> Result<(), Box<dyn Error>> {
+        let client_connection = self.client_connections.get_mut(token).unwrap();
+        let messages = &mut client_connection.pending_messages;
+
+        // would it be better to first just parse all the messages to
+        // one [u8] buf just write the buf in one go? i guess it would
+        while !messages.is_empty() {
+            let message = match messages.pop_back() {
+                Some(message) => {message}
+                None => continue,
+            };
+
+            let message = message.borrow_mut();
+
+            loop {
+                info!("Writing: {}", message);
+                match client_connection.tcp_stream.write(message.content.as_bytes()) {
+                    // We want to write the entire `DATA` buffer in a single go. If we
+                    // write less we'll return a short write error (same as
+                    // `io::Write::write_all` does).
+                    Ok(n) if n < message.content.len() => {
+                        warn!("Couldn't write all bytes for message: {}", message);
+                        continue;
+                    },
+                    Ok(_) => break,
+                    // Would block "errors" are the OS's way of saying that the
+                    // connection is not actually ready to perform this I/O operation.
+                    Err(ref err) if Self::would_block(err) => {}
+                    // Got interrupted (how rude!), we'll try again.
+                    Err(ref err) if Self::interrupted(err) => continue,
+                    // Other errors we'll consider fatal.
+                    Err(err) => return Err(Box::new(err)),
+                }
             }
         }
 
-        if connection_closed {
-            info!("Connection closed");
-            self.poll.registry().deregister(client_connection)?;
-        }
+        debug!("Messages after write: {:?}", messages);
         Ok(())
+    }
+
+    fn get_peer_addr_or_default(tcp_stream: &TcpStream) -> String {
+        match tcp_stream.peer_addr() {
+            Ok(addr) => addr.to_string(),
+            Err(_) => "0.0.0.0".to_string(),
+        }
     }
 
     fn would_block(err: &std::io::Error) -> bool {
