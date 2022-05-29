@@ -22,6 +22,9 @@ pub fn run_chat() -> Result<(), Box<dyn Error>> {
     chat.start_event_loop()
 }
 
+const TIMEOUT: Option<Duration> = Some(Duration::from_secs(16));
+const READ_BUFFER_SIZE: usize = 4096;
+
 #[derive(Debug)]
 struct Message {
     from: SocketAddr,
@@ -37,14 +40,16 @@ impl std::fmt::Display for Message {
 // TODO: add peer_addr, with tpc_streams lifetime to the ClientConnection struct,
 //   checking every time for valid socketaddr from tcpstream is annoying
 struct ClientConnection {
+    address: SocketAddr,
     tcp_stream: TcpStream,
     pending_messages: VecDeque<Rc<RefCell<Message>>>,
 }
 
 impl ClientConnection {
-    fn new(tcp_stream: TcpStream) -> ClientConnection {
+    fn new(address: SocketAddr, tcp_stream: TcpStream) -> ClientConnection {
         ClientConnection {
             pending_messages: VecDeque::new(),
+            address,
             tcp_stream,
         }
     }
@@ -89,12 +94,10 @@ impl MioTcpChat {
     }
 
     fn event_loop_iteration(&mut self) -> Result<(), Box<dyn Error>> {
-        // Poll all registered event sources for events
-        const TIMEOUT: Option<Duration> = Some(Duration::from_secs(16));
+
         let mut events_storage = Events::with_capacity(32);
         self.poll.poll(&mut events_storage, TIMEOUT)?;
 
-        // Process each event we got
         for event in events_storage.iter() {
             debug!("New event!\n\t{:?}\n", event);
 
@@ -108,15 +111,11 @@ impl MioTcpChat {
     }
 
     fn handle_server_token_event(&mut self) -> Result<(), Box<dyn Error>> {
-        // why is a loop here tho?
-        // is it that one event can mean multiple different connections?
         loop {
             let (mut client_connection, address) = match self.listener.accept() {
                 Ok((connection, address)) => (connection, address),
-                Err(e) if Self::would_block(&e) => {
-                    // No more queued connections, go back to polling
-                    break;
-                }
+                // No more queued connections, go back to polling
+                Err(e) if Self::would_block(&e) => break,
                 Err(e) => return Err(Box::new(e)),
             };
 
@@ -131,58 +130,43 @@ impl MioTcpChat {
 
             self.client_connections.insert(
                 client_connection_token,
-                ClientConnection::new(client_connection),
+                ClientConnection::new(address, client_connection),
             );
         }
         Ok(())
     }
 
-    /*
-    Now if this is supposed to be a chat how to handle the messages?
-        - we start the server and register each new client for polling with readable and writable interest
-        - when we get a message:
-            - for each client we push the message to its queue so that it can
-               be sent to them once the socket becomes writable
-        - when we get an event that a socket became writable we write the messages to it
-        - after writing we re-register the socket as readable
-
-       This is kind of shit but whatever, I'm trying to learn
-     */
     fn handle_client_connection_token_event(
         &mut self,
         event: &Event,
     ) -> Result<(), Box<dyn Error>> {
-        // first verify if we know of this connection
         let token = &event.token();
         if !self.client_connections.contains_key(token) {
             warn!("Weird event without associated connection: ${:?}", event);
             return Ok(());
         }
 
-        let mut connection_closed = false;
         if event.is_readable() {
-            let mut received_data = vec![0; 4096];
+            let mut received_data = vec![0; READ_BUFFER_SIZE];
             let (did_close, bytes_read) = self.read_from_client(token, &mut received_data)?;
             if bytes_read != 0 {
                 self.handle_client_message(token, &mut received_data, bytes_read);
             }
-            connection_closed = did_close;
+
+            if did_close {
+                let mut client_connection = self.client_connections.remove(token).unwrap();
+                info!("Connection with {} closed", &client_connection.address);
+                self.poll
+                    .registry()
+                    .deregister(&mut client_connection.tcp_stream)?;
+                return Ok(());
+            }
         }
 
         if event.is_writable() {
             self.write_pending_messages_to_client(token)?;
         }
 
-        if connection_closed {
-            let mut client_connection = self.client_connections.remove(token).unwrap();
-            info!(
-                "Connection with {} closed",
-                Self::get_peer_addr_or_default(&client_connection.tcp_stream)
-            );
-            self.poll
-                .registry()
-                .deregister(&mut client_connection.tcp_stream)?;
-        }
         Ok(())
     }
 
@@ -224,38 +208,30 @@ impl MioTcpChat {
         received_data: &mut [u8],
         bytes_read: usize,
     ) {
-        let client_tcp_stream = &mut self.client_connections.get_mut(token).unwrap().tcp_stream;
-        let peer_addr = match client_tcp_stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(_) => {
-                warn!("Dropping weird message from peer with no address.");
-                return;
-            },
-        };
-
+        let client_connection = self.client_connections.get_mut(token).unwrap();
         if let Ok(str_buf) = std::str::from_utf8(&received_data[..bytes_read]) {
             let message = Message {
-                from: peer_addr,
+                from: client_connection.address,
                 content: String::from(str_buf.trim_end()),
             };
 
-            info!("Registered message:'\n\t{}", message);
             self.queue_message_for_other_peers(message);
         } else {
-            warn!("Dropping message with none UTF-8 content from {}", peer_addr);
+            warn!(
+                "Dropping message with none UTF-8 content from {}",
+                client_connection.address
+            );
         }
     }
 
-
     fn queue_message_for_other_peers(&mut self, message: Message) {
+        info!("Queued new message: {}", message);
         let message = Rc::new(RefCell::new(message));
-        // FIXME: Note: `#[warn(clippy::for_kv_map)]` on by default
-        for (_, connection) in &mut self.client_connections {
+        for connection in self.client_connections.values_mut() {
             if connection.tcp_stream.peer_addr().unwrap() != message.borrow().from {
                 connection.pending_messages.push_front(message.clone());
             }
         }
-        info!("message pushed for peers: {:?}", message.borrow());
     }
 
     fn write_pending_messages_to_client(&mut self, token: &Token) -> Result<(), Box<dyn Error>> {
@@ -266,22 +242,23 @@ impl MioTcpChat {
         // one [u8] buf just write the buf in one go? i guess it would
         while !messages.is_empty() {
             let message = match messages.pop_back() {
-                Some(message) => {message}
+                Some(message) => message,
                 None => continue,
             };
 
-            let message = message.borrow_mut();
+            let message = message.borrow();
+            let message = format!("{}: {}\n", message.from, message.content);
 
             loop {
                 info!("Writing: {}", message);
-                match client_connection.tcp_stream.write(message.content.as_bytes()) {
+                match client_connection.tcp_stream.write(message.as_bytes()) {
                     // We want to write the entire `DATA` buffer in a single go. If we
                     // write less we'll return a short write error (same as
                     // `io::Write::write_all` does).
-                    Ok(n) if n < message.content.len() => {
+                    Ok(n) if n < message.len() => {
                         warn!("Couldn't write all bytes for message: {}", message);
                         continue;
-                    },
+                    }
                     Ok(_) => break,
                     // Would block "errors" are the OS's way of saying that the
                     // connection is not actually ready to perform this I/O operation.
@@ -294,15 +271,7 @@ impl MioTcpChat {
             }
         }
 
-        debug!("Messages after write: {:?}", messages);
         Ok(())
-    }
-
-    fn get_peer_addr_or_default(tcp_stream: &TcpStream) -> String {
-        match tcp_stream.peer_addr() {
-            Ok(addr) => addr.to_string(),
-            Err(_) => "0.0.0.0".to_string(),
-        }
     }
 
     fn would_block(err: &std::io::Error) -> bool {

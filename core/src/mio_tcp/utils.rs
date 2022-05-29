@@ -17,5 +17,3 @@ impl UniqueTokenGenerator {
         Token(token)
     }
 }
-
-// TODO: tests
