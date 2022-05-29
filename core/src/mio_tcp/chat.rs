@@ -99,7 +99,7 @@ impl MioTcpChat {
         self.poll.poll(&mut events_storage, TIMEOUT)?;
 
         for event in events_storage.iter() {
-            debug!("New event!\n\t{:?}\n", event);
+            debug!("New event:\n\t{:?}\n", event);
 
             match event.token() {
                 token if token == self.listener_token => self.handle_server_token_event()?,
@@ -227,10 +227,16 @@ impl MioTcpChat {
     fn queue_message_for_other_peers(&mut self, message: Message) {
         info!("Queued new message: {}", message);
         let message = Rc::new(RefCell::new(message));
-        for connection in self.client_connections.values_mut() {
+        for (token, connection) in &mut self.client_connections {
             if connection.tcp_stream.peer_addr().unwrap() != message.borrow().from {
                 connection.pending_messages.push_front(message.clone());
             }
+
+            self.poll.registry().reregister(
+                &mut connection.tcp_stream,
+                *token,
+                Interest::READABLE.add(Interest::WRITABLE),
+            ).expect(&*format!("Couldn't re-register {}", connection.address.to_string()));
         }
     }
 
