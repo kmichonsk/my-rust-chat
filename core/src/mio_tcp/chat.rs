@@ -33,7 +33,7 @@ struct Message {
 
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}: {})", self.from.to_string(), self.content)
+        write!(f, "({}: {})", self.from, self.content)
     }
 }
 
@@ -238,10 +238,7 @@ impl MioTcpChat {
                     *token,
                     Interest::READABLE.add(Interest::WRITABLE),
                 )
-                .expect(&*format!(
-                    "Couldn't re-register {}",
-                    connection.address.to_string()
-                ));
+                .expect(&*format!("Couldn't re-register {}", connection.address));
         }
     }
 
