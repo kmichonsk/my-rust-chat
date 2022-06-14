@@ -94,7 +94,6 @@ impl MioTcpChat {
     }
 
     fn event_loop_iteration(&mut self) -> Result<(), Box<dyn Error>> {
-
         let mut events_storage = Events::with_capacity(32);
         self.poll.poll(&mut events_storage, TIMEOUT)?;
 
@@ -232,11 +231,17 @@ impl MioTcpChat {
                 connection.pending_messages.push_front(message.clone());
             }
 
-            self.poll.registry().reregister(
-                &mut connection.tcp_stream,
-                *token,
-                Interest::READABLE.add(Interest::WRITABLE),
-            ).expect(&*format!("Couldn't re-register {}", connection.address.to_string()));
+            self.poll
+                .registry()
+                .reregister(
+                    &mut connection.tcp_stream,
+                    *token,
+                    Interest::READABLE.add(Interest::WRITABLE),
+                )
+                .expect(&*format!(
+                    "Couldn't re-register {}",
+                    connection.address.to_string()
+                ));
         }
     }
 
